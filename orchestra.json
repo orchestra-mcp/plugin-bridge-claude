@@ -1,0 +1,23 @@
+{
+    "name": "orchestra-mcp/plugin-bridge-claude",
+    "description": "bridge-claude tools plugin for Orchestra MCP.",
+    "type": "tools",
+    "license": "MIT",
+    "homepage": "https://orchestra-mcp.dev",
+    "support": {
+        "issues": "https://github.com/orchestra-mcp/plugin-bridge-claude/issues",
+        "source": "https://github.com/orchestra-mcp/plugin-bridge-claude"
+    },
+    "require": {
+        "orchestra-mcp/gen-go": "^0.1.0",
+        "orchestra-mcp/sdk-go": "^0.1.0"
+    },
+    "bin": "bridge-claude",
+    "extra": {
+        "plugin-id": "tools.bridge-claude",
+        "provides": ["tools"],
+        "branch-alias": {
+            "dev-master": "0.1.x-dev"
+        }
+    }
+}
