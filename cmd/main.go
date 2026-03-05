@@ -35,9 +35,16 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		bp.KillAll() // kill all running claude processes
+		bp.KillAll() // kill all running claude processes + stop permission server
 		cancel()
 	}()
+
+	// Start the PreToolUse permission HTTP server so the hook script can
+	// forward tool-approval requests to the Swift UI.
+	if err := bp.StartPermissionServer(ctx); err != nil {
+		log.Printf("bridge.claude: permission server unavailable: %v", err)
+		// Non-fatal — permissions will auto-approve if server is not running.
+	}
 
 	if err := p.Run(ctx); err != nil {
 		log.Fatalf("bridge.claude: %v", err)

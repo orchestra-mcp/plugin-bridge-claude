@@ -40,6 +40,42 @@ type ProcessHandle interface {
 	Kill() error
 	GetResponse() *ChatResponse
 	WaitResponse(ctx context.Context) (*ChatResponse, error)
+	SetAutoApprove(bool)
+	GetEventCh() <-chan ChatEvent
+}
+
+// ChatEventType classifies streaming events for the UI.
+type ChatEventType string
+
+const (
+	EventTextChunk  ChatEventType = "text_chunk"
+	EventToolStart  ChatEventType = "tool_start"
+	EventToolEnd    ChatEventType = "tool_end"
+	EventThinking   ChatEventType = "thinking"
+	EventStatus     ChatEventType = "status"
+	EventResult     ChatEventType = "result"
+	EventError      ChatEventType = "error"
+	EventPermission ChatEventType = "permission" // permission request from Claude
+	EventQuestion   ChatEventType = "question"   // AskUserQuestion from Claude
+)
+
+// ChatEvent is a single granular event emitted during a Claude session.
+type ChatEvent struct {
+	Type       ChatEventType `json:"type"`
+	SessionID  string        `json:"session_id"`
+	Text       string        `json:"text,omitempty"`
+	ToolName   string        `json:"tool_name,omitempty"`
+	ToolID     string        `json:"tool_id,omitempty"`
+	ToolInput  string        `json:"tool_input,omitempty"`
+	ToolError  bool          `json:"tool_error,omitempty"`
+	TokensIn   int64         `json:"tokens_in,omitempty"`
+	TokensOut  int64         `json:"tokens_out,omitempty"`
+	CostUSD    float64       `json:"cost_usd,omitempty"`
+	ModelUsed  string        `json:"model_used,omitempty"`
+	DurationMs int64         `json:"duration_ms,omitempty"`
+	// Permission/Question fields
+	RequestID string `json:"request_id,omitempty"` // control_request ID for responding
+	Reason    string `json:"reason,omitempty"`     // why the tool needs permission
 }
 
 // SpawnFunc is the function signature for spawning a Claude Code CLI process.
@@ -159,16 +195,8 @@ func AIPrompt(bridge *Bridge) plugin.ToolHandler {
 
 		wait := helpers.GetBool(req.Arguments, "wait")
 
-		// Synchronous mode: block until completion.
-		if wait || bridge.SpawnBackground == nil {
-			resp, err := bridge.Spawn(ctx, opts)
-			if err != nil {
-				return helpers.ErrorResult("spawn_error", err.Error()), nil
-			}
-			return helpers.TextResult(formatChatResponse(resp)), nil
-		}
-
-		// Async mode (default): start in background, return immediately.
+		// Always use SpawnBackground so process is tracked immediately
+		// and permission requests can be drained during execution.
 		sessionID := generateSessionID()
 		opts.SessionID = sessionID
 
@@ -178,6 +206,20 @@ func AIPrompt(bridge *Bridge) plugin.ToolHandler {
 		}
 
 		bridge.Plugin.TrackProcess(proc)
+
+		// Synchronous mode: wait for completion before returning.
+		// Do NOT auto-approve — permission requests go to PermissionCh
+		// and the Swift UI drains them via get_pending_permission polling.
+		if wait {
+			resp, waitErr := proc.WaitResponse(ctx)
+			if waitErr != nil && resp == nil {
+				return helpers.ErrorResult("spawn_error", waitErr.Error()), nil
+			}
+			if resp != nil {
+				return helpers.TextResult(formatChatResponse(resp)), nil
+			}
+			return helpers.TextResult("[no response]"), nil
+		}
 
 		return helpers.TextResult(fmt.Sprintf(
 			"## Prompt Started\n\n"+
@@ -211,11 +253,15 @@ func parseCommonOpts(args *structpb.Struct) (SpawnOptions, error) {
 	systemPrompt := helpers.GetString(args, "system_prompt")
 	envRaw := helpers.GetString(args, "env")
 
-	// Default workspace to current working directory.
+	// Default workspace to the orchestra project root (set by the serve
+	// command), falling back to the current working directory.
 	if workspace == "" {
-		cwd, err := os.Getwd()
-		if err == nil {
-			workspace = cwd
+		workspace = os.Getenv("ORCHESTRA_WORKSPACE")
+		if workspace == "" {
+			cwd, err := os.Getwd()
+			if err == nil {
+				workspace = cwd
+			}
 		}
 	}
 
@@ -287,6 +333,154 @@ func AIPromptStream(bridge *Bridge) plugin.StreamingToolHandler {
 			}
 		})
 		return err
+	}
+}
+
+// --- chat_stream ---
+
+// ChatStreamSchema returns the JSON Schema for the chat_stream streaming tool.
+// It accepts session_id + prompt for session-aware streaming.
+func ChatStreamSchema() *structpb.Struct {
+	s, _ := structpb.NewStruct(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"session_id": map[string]any{
+				"type":        "string",
+				"description": "Session ID for the chat session",
+			},
+			"prompt": map[string]any{
+				"type":        "string",
+				"description": "The prompt to send to Claude Code",
+			},
+			"resume": map[string]any{
+				"type":        "boolean",
+				"description": "Whether to resume an existing Claude session",
+			},
+			"model": map[string]any{
+				"type":        "string",
+				"description": "Model to use (e.g., sonnet, opus, haiku)",
+			},
+			"workspace": map[string]any{
+				"type":        "string",
+				"description": "Working directory for Claude Code",
+			},
+			"allowed_tools": map[string]any{
+				"type":        "string",
+				"description": "Comma-separated list of allowed tools (e.g., Bash,Read,Edit)",
+			},
+			"permission_mode": map[string]any{
+				"type":        "string",
+				"description": "Permission mode (e.g., default, plan, bypassPermissions)",
+			},
+			"max_budget": map[string]any{
+				"type":        "number",
+				"description": "Maximum budget in USD",
+			},
+			"system_prompt": map[string]any{
+				"type":        "string",
+				"description": "Custom system prompt",
+			},
+			"env": map[string]any{
+				"type":        "string",
+				"description": "JSON object of environment variables",
+			},
+		},
+		"required": []any{"session_id", "prompt"},
+	})
+	return s
+}
+
+// ChatStream returns a StreamingToolHandler that yields ChatEvent JSON chunks
+// as they are emitted by the Claude Code CLI. The caller receives granular
+// events (text_chunk, tool_start, tool_end, status, result, error) and can
+// update the UI in real-time.
+func ChatStream(bridge *Bridge) plugin.StreamingToolHandler {
+	return func(ctx context.Context, req *pluginv1.StreamStart, chunks chan<- []byte) error {
+		if req.Arguments == nil {
+			return fmt.Errorf("missing required parameters: session_id, prompt")
+		}
+
+		sessionID := req.Arguments.GetFields()["session_id"]
+		if sessionID == nil || sessionID.GetStringValue() == "" {
+			return fmt.Errorf("missing required parameter: session_id")
+		}
+		promptVal := req.Arguments.GetFields()["prompt"]
+		if promptVal == nil || promptVal.GetStringValue() == "" {
+			return fmt.Errorf("missing required parameter: prompt")
+		}
+
+		opts, err := parseCommonOpts(req.Arguments)
+		if err != nil {
+			return err
+		}
+		opts.SessionID = sessionID.GetStringValue()
+
+		// Check if we should resume an existing Claude session.
+		if resumeVal := req.Arguments.GetFields()["resume"]; resumeVal != nil {
+			opts.Resume = resumeVal.GetBoolValue()
+		}
+
+		if bridge.SpawnBackground == nil {
+			return fmt.Errorf("streaming not supported: SpawnBackground not configured")
+		}
+
+		proc, err := bridge.SpawnBackground(ctx, opts)
+		if err != nil {
+			return err
+		}
+
+		bridge.Plugin.TrackProcess(proc)
+		// Do NOT auto-approve — permission events flow through EventCh
+		// and the Swift UI presents them. User responds via respond_to_permission.
+
+		// Drain EventCh and send each event as a JSON chunk.
+		eventCh := proc.GetEventCh()
+		if eventCh == nil {
+			// Fallback: wait for completion and send a single result event.
+			resp, waitErr := proc.WaitResponse(ctx)
+			if waitErr != nil && resp == nil {
+				return waitErr
+			}
+			if resp != nil {
+				ev := ChatEvent{
+					Type:       EventResult,
+					SessionID:  opts.SessionID,
+					Text:       resp.ResponseText,
+					TokensIn:   resp.TokensIn,
+					TokensOut:  resp.TokensOut,
+					CostUSD:    resp.CostUSD,
+					ModelUsed:  resp.ModelUsed,
+					DurationMs: resp.DurationMs,
+				}
+				data, _ := json.Marshal(ev)
+				select {
+				case chunks <- data:
+				case <-ctx.Done():
+				}
+			}
+			return nil
+		}
+
+		// Stream events until the channel closes or context is cancelled.
+		for {
+			select {
+			case ev, ok := <-eventCh:
+				if !ok {
+					return nil // EventCh closed — process done
+				}
+				data, marshalErr := json.Marshal(ev)
+				if marshalErr != nil {
+					continue
+				}
+				select {
+				case chunks <- data:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 	}
 }
 

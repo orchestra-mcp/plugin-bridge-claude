@@ -89,24 +89,28 @@ func SpawnSession(bridge *Bridge) plugin.ToolHandler {
 		opts.SessionID = sessionID
 		opts.Resume = resume
 
-		// Synchronous mode: block until completion (used by cross-plugin
-		// callers like send_message which have the full QUIC timeout).
-		if wait || bridge.SpawnBackground == nil {
-			proc, resp, err := bridge.SpawnAsync(ctx, opts)
-			if err != nil {
-				return helpers.ErrorResult("spawn_error", err.Error()), nil
-			}
-			bridge.Plugin.TrackProcess(proc)
-			return helpers.TextResult(formatChatResponse(resp)), nil
-		}
-
-		// Async mode (default): start in background, return immediately.
+		// Always use SpawnBackground so the process is tracked immediately
+		// and permission requests can be drained by get_pending_permission.
 		proc, err := bridge.SpawnBackground(ctx, opts)
 		if err != nil {
 			return helpers.ErrorResult("spawn_error", err.Error()), nil
 		}
 
 		bridge.Plugin.TrackProcess(proc)
+
+		// Synchronous mode: wait for completion before returning.
+		// Do NOT auto-approve — permission requests go to PermissionCh
+		// and the Swift UI drains them via get_pending_permission polling.
+		if wait {
+			resp, waitErr := proc.WaitResponse(ctx)
+			if waitErr != nil && resp == nil {
+				return helpers.ErrorResult("spawn_error", waitErr.Error()), nil
+			}
+			if resp != nil {
+				return helpers.TextResult(formatChatResponse(resp)), nil
+			}
+			return helpers.TextResult("[no response]"), nil
+		}
 
 		return helpers.TextResult(fmt.Sprintf(
 			"## Session Started\n\n"+
