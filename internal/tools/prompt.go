@@ -34,6 +34,7 @@ type BridgePluginInterface interface {
 type ProcessHandle interface {
 	IsRunning() bool
 	GetSessionID() string
+	SetSessionID(string)
 	GetPID() int
 	GetStartedAt() string
 	GetUptimeSeconds() float64
@@ -189,22 +190,31 @@ func AIPrompt(bridge *Bridge) plugin.ToolHandler {
 		if err != nil {
 			return helpers.ErrorResult("validation_error", err.Error()), nil
 		}
-		// One-shot: no session ID.
+		// One-shot: don't pass --session-id to Claude CLI (it requires UUIDs).
+		// We generate an internal tracking ID but keep opts.SessionID empty
+		// so buildArgs won't add --session-id to the CLI invocation.
 		opts.SessionID = ""
 		opts.Resume = false
 
 		wait := helpers.GetBool(req.Arguments, "wait")
 
-		// Always use SpawnBackground so process is tracked immediately
-		// and permission requests can be drained during execution.
-		sessionID := generateSessionID()
-		opts.SessionID = sessionID
+		// Generate an internal tracking ID (not passed to Claude CLI).
+		trackingID := generateSessionID()
 
+		// Spawn without --session-id (one-shot mode).
 		proc, err := bridge.SpawnBackground(ctx, opts)
 		if err != nil {
 			return helpers.ErrorResult("spawn_error", err.Error()), nil
 		}
 
+		// When permission_mode is bypassPermissions, auto-approve all
+		// permission requests on the Go side immediately.
+		if opts.PermissionMode == "bypassPermissions" || opts.PermissionMode == "dontAsk" {
+			proc.SetAutoApprove(true)
+		}
+
+		// Set tracking ID on the process for internal lookups.
+		proc.SetSessionID(trackingID)
 		bridge.Plugin.TrackProcess(proc)
 
 		// Synchronous mode: wait for completion before returning.
@@ -228,7 +238,7 @@ func AIPrompt(bridge *Bridge) plugin.ToolHandler {
 				"- **Status:** running\n\n"+
 				"Use `session_status` with session_id `%s` to check progress.\n"+
 				"The response will be available when the process completes.\n",
-			sessionID, proc.GetPID(), sessionID,
+			proc.GetSessionID(), proc.GetPID(), proc.GetSessionID(),
 		)), nil
 	}
 }
@@ -429,8 +439,14 @@ func ChatStream(bridge *Bridge) plugin.StreamingToolHandler {
 			return err
 		}
 
+		// When permission_mode is bypassPermissions, auto-approve all
+		// permission requests on the Go side immediately.
+		if opts.PermissionMode == "bypassPermissions" || opts.PermissionMode == "dontAsk" {
+			proc.SetAutoApprove(true)
+		}
+
 		bridge.Plugin.TrackProcess(proc)
-		// Do NOT auto-approve — permission events flow through EventCh
+		// For non-bypass modes, permission events flow through EventCh
 		// and the Swift UI presents them. User responds via respond_to_permission.
 
 		// Drain EventCh and send each event as a JSON chunk.

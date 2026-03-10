@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"os"
 	"sync"
 
@@ -82,6 +83,10 @@ func (bp *BridgePlugin) RegisterTools(builder *plugin.PluginBuilder) {
 	builder.RegisterTool("respond_permission",
 		"Respond to a pending permission or question request with approve/deny/answer",
 		tools.RespondPermissionSchema(), tools.RespondPermission(permStore))
+
+	builder.RegisterTool("drain_session_events",
+		"Non-blocking drain of all pending chat events from active Claude sessions",
+		tools.DrainSessionEventsSchema(), tools.DrainSessionEvents(permStore))
 }
 
 // --- PermissionBridge interface implementation ---
@@ -154,9 +159,53 @@ func (bp *BridgePlugin) DrainPendingQuestions() []tools.StdioQuestionRequest {
 	return result
 }
 
+// DrainSessionEvents non-blocking drains all pending ChatEvent items from all
+// active processes' EventCh channels.
+func (bp *BridgePlugin) DrainSessionEvents() []tools.ChatEvent {
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+
+	var result []tools.ChatEvent
+	for _, proc := range bp.active {
+		if proc.EventCh == nil {
+			continue
+		}
+		for {
+			select {
+			case ev, ok := <-proc.EventCh:
+				if !ok {
+					goto nextEvProc
+				}
+				result = append(result, tools.ChatEvent{
+					Type:       tools.ChatEventType(ev.Type),
+					SessionID:  ev.SessionID,
+					Text:       ev.Text,
+					ToolName:   ev.ToolName,
+					ToolID:     ev.ToolID,
+					ToolInput:  ev.ToolInput,
+					ToolError:  ev.ToolError,
+					TokensIn:   ev.TokensIn,
+					TokensOut:  ev.TokensOut,
+					CostUSD:    ev.CostUSD,
+					ModelUsed:  ev.ModelUsed,
+					DurationMs: ev.DurationMs,
+					RequestID:  ev.RequestID,
+					Reason:     ev.Reason,
+				})
+			default:
+				goto nextEvProc
+			}
+		}
+	nextEvProc:
+	}
+	return result
+}
+
 // RespondPermission finds the active process that owns the given requestID and
-// sends the permission decision via stdin control_response.
-func (bp *BridgePlugin) RespondPermission(requestID string, approved bool) bool {
+// sends the permission decision via stdin control_response. toolInput is the
+// original tool arguments that must be echoed back so Claude CLI knows what
+// to execute.
+func (bp *BridgePlugin) RespondPermission(requestID string, approved bool, toolInput json.RawMessage) bool {
 	bp.mu.RLock()
 	defer bp.mu.RUnlock()
 
@@ -164,7 +213,7 @@ func (bp *BridgePlugin) RespondPermission(requestID string, approved bool) bool 
 		if proc.IsRunning() {
 			// Try writing — if this process doesn't own the requestID,
 			// the CLI will ignore the response (harmless).
-			if err := proc.WritePermission(requestID, approved, nil); err == nil {
+			if err := proc.WritePermission(requestID, approved, toolInput); err == nil {
 				return true
 			}
 		}
@@ -172,18 +221,38 @@ func (bp *BridgePlugin) RespondPermission(requestID string, approved bool) bool 
 	return false
 }
 
-// RespondQuestion finds the active process and sends the question answer.
-func (bp *BridgePlugin) RespondQuestion(requestID, answer string) bool {
+// HasRunningProcesses returns true if any Claude process is currently active.
+func (bp *BridgePlugin) HasRunningProcesses() bool {
 	bp.mu.RLock()
 	defer bp.mu.RUnlock()
-
 	for _, proc := range bp.active {
 		if proc.IsRunning() {
-			if err := proc.WriteQuestion(requestID, answer); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// RespondQuestion finds the active process and sends the question answer.
+// rawInput is the original AskUserQuestion tool input from the control_request.
+func (bp *BridgePlugin) RespondQuestion(requestID, answer string, rawInput json.RawMessage) bool {
+	log.Printf("[bridge] RespondQuestion: acquiring RLock for id=%s", requestID[:min(len(requestID), 8)])
+	bp.mu.RLock()
+	defer bp.mu.RUnlock()
+	log.Printf("[bridge] RespondQuestion: RLock acquired, %d active procs", len(bp.active))
+
+	for sid, proc := range bp.active {
+		if proc.IsRunning() {
+			log.Printf("[bridge] RespondQuestion: writing to proc %s", sid[:min(len(sid), 8)])
+			if err := proc.WriteQuestion(requestID, answer, rawInput); err == nil {
+				log.Printf("[bridge] RespondQuestion: success")
 				return true
+			} else {
+				log.Printf("[bridge] RespondQuestion: write error: %v", err)
 			}
 		}
 	}
+	log.Printf("[bridge] RespondQuestion: no running process accepted the answer")
 	return false
 }
 
@@ -291,6 +360,7 @@ type processAdapter struct {
 
 func (a *processAdapter) IsRunning() bool          { return a.cp.IsRunning() }
 func (a *processAdapter) GetSessionID() string      { return a.cp.GetSessionID() }
+func (a *processAdapter) SetSessionID(id string)    { a.cp.SetSessionID(id) }
 func (a *processAdapter) GetPID() int               { return a.cp.GetPID() }
 func (a *processAdapter) GetStartedAt() string      { return a.cp.GetStartedAt() }
 func (a *processAdapter) GetUptimeSeconds() float64 { return a.cp.GetUptimeSeconds() }

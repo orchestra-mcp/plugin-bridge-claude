@@ -96,6 +96,14 @@ func SpawnSession(bridge *Bridge) plugin.ToolHandler {
 			return helpers.ErrorResult("spawn_error", err.Error()), nil
 		}
 
+		// When permission_mode is bypassPermissions, auto-approve all
+		// permission requests on the Go side. Without this, dangerous tool
+		// requests go into PermissionCh and block forever because nobody
+		// drains the channel (web callers only poll session_status).
+		if opts.PermissionMode == "bypassPermissions" || opts.PermissionMode == "dontAsk" {
+			proc.SetAutoApprove(true)
+		}
+
 		bridge.Plugin.TrackProcess(proc)
 
 		// Synchronous mode: wait for completion before returning.

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -176,6 +177,12 @@ func (cp *ClaudeProcess) GetSessionID() string {
 	return cp.SessionID
 }
 
+// SetSessionID sets the internal tracking ID (used when --session-id is not
+// passed to the CLI, e.g. one-shot ai_prompt calls).
+func (cp *ClaudeProcess) SetSessionID(id string) {
+	cp.SessionID = id
+}
+
 // GetPID returns the OS process ID, or 0 if the process has not started.
 func (cp *ClaudeProcess) GetPID() int {
 	if cp.Cmd != nil && cp.Cmd.Process != nil {
@@ -291,18 +298,39 @@ func (cp *ClaudeProcess) WritePermission(requestID string, approved bool, toolIn
 }
 
 // WriteQuestion sends an AskUserQuestion answer back to the Claude process.
-func (cp *ClaudeProcess) WriteQuestion(requestID, answer string) error {
-	controlResp := map[string]any{
-		"type": "control_response",
-		"response": map[string]any{
-			"subtype":    "success",
-			"request_id": requestID,
-			"response": map[string]any{
-				"answer": answer,
-			},
-		},
+// AskUserQuestion goes through the same can_use_tool permission flow as other
+// tools. Claude CLI validates updatedInput against the tool's Zod schema, so
+// we must echo the FULL original tool input (questions, options, etc.) with
+// the user's answers merged in. This matches the orch-ref desktop flow:
+// submitQuestionAnswer → bridge.Permission({toolInput: {answers}}).
+//
+// rawInput is the original AskUserQuestion tool input from the control_request.
+// answer is either a JSON string like `{"answers":{...}}` or a plain string.
+func (cp *ClaudeProcess) WriteQuestion(requestID, answer string, rawInput json.RawMessage) error {
+	// Start with the full original tool input so all required fields
+	// (questions, header, options, etc.) are present for Zod validation.
+	merged := map[string]any{}
+	if len(rawInput) > 0 {
+		_ = json.Unmarshal(rawInput, &merged)
 	}
-	return cp.writeStdinJSON(controlResp)
+
+	// Parse the answer and merge answers into the original input.
+	var answerData map[string]any
+	if json.Valid([]byte(answer)) {
+		_ = json.Unmarshal([]byte(answer), &answerData)
+	}
+
+	if answers, ok := answerData["answers"]; ok {
+		merged["answers"] = answers
+	} else if answer != "" {
+		// Plain string fallback.
+		merged["answers"] = map[string]string{
+			"question": answer,
+		}
+	}
+
+	toolInput, _ := json.Marshal(merged)
+	return cp.WritePermission(requestID, true, json.RawMessage(toolInput))
 }
 
 // writeStdinJSON marshals data as JSON and writes it to the Claude process stdin.
@@ -315,6 +343,12 @@ func (cp *ClaudeProcess) writeStdinJSON(data any) error {
 	b, err := json.Marshal(data)
 	if err != nil {
 		return err
+	}
+	log.Printf("[stdin] writing control_response: %s", string(b))
+	// Debug: write to file since bridge-claude stderr isn't captured
+	if f, ferr := os.OpenFile("/tmp/orchestra-stdin-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); ferr == nil {
+		fmt.Fprintf(f, "[%s] %s\n", time.Now().Format("15:04:05"), string(b))
+		f.Close()
 	}
 	b = append(b, '\n')
 	_, err = cp.stdinPipe.Write(b)
@@ -492,7 +526,7 @@ func SpawnAsync(ctx context.Context, opts SpawnOptions) (*ClaudeProcess, *ChatRe
 		StartedAt:    time.Now(),
 		Done:         make(chan struct{}),
 		PermissionCh: make(chan StdioPermissionRequest, 16),
-		QuestionCh:   make(chan QuestionRequest, 4),
+		QuestionCh:   make(chan QuestionRequest, 16),
 	}
 
 	stdout, err := cmd.StdoutPipe()
@@ -599,7 +633,7 @@ func SpawnBackground(ctx context.Context, opts SpawnOptions) (*ClaudeProcess, er
 		StartedAt:    time.Now(),
 		Done:         make(chan struct{}),
 		PermissionCh: make(chan StdioPermissionRequest, 16),
-		QuestionCh:   make(chan QuestionRequest, 4),
+		QuestionCh:   make(chan QuestionRequest, 16),
 		EventCh:      make(chan ChatEvent, 64),
 	}
 
@@ -818,6 +852,14 @@ func handleControlRequest(cp *ClaudeProcess, event map[string]any) {
 		return
 	}
 
+	// Debug: log the raw control_request
+	if rawEvt, err := json.Marshal(event); err == nil {
+		if f, ferr := os.OpenFile("/tmp/orchestra-stdin-debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); ferr == nil {
+			fmt.Fprintf(f, "[%s] CONTROL_REQUEST: %s\n", time.Now().Format("15:04:05"), string(rawEvt))
+			f.Close()
+		}
+	}
+
 	rawRequest, ok := event["request"]
 	if !ok {
 		// No request body — auto-approve.
@@ -877,14 +919,18 @@ func handleControlRequest(cp *ClaudeProcess, event map[string]any) {
 					ToolID:    body.ToolUseID,
 				})
 			}
-			// Try to send to QuestionCh; if buffer is full, auto-approve to
-			// avoid blocking the scanner goroutine.
+			// Try to send to QuestionCh; if buffer is full, auto-answer
+			// with the first option to avoid blocking the scanner goroutine.
 			select {
 			case cp.QuestionCh <- qr:
-				return // Swift UI will call WriteQuestion() later
+				return // UI will call WriteQuestion() later
 			default:
-				// Buffer full — auto-approve with first option.
-				_ = cp.WritePermission(reqID, true, nil)
+				// Buffer full — auto-answer with the first option label.
+				fallbackAnswer := "approve"
+				if len(inp.Questions) > 0 && len(inp.Questions[0].Options) > 0 {
+					fallbackAnswer = inp.Questions[0].Options[0].Label
+				}
+				_ = cp.WriteQuestion(reqID, fallbackAnswer, body.Input)
 				return
 			}
 		}
@@ -1095,8 +1141,12 @@ func buildArgs(opts SpawnOptions) []string {
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
 		"--verbose",
-		"--permission-prompt-tool", "stdio",
 	}
+
+	// Always use --permission-prompt-tool stdio so permission requests come
+	// as control_request events on stdout. We handle auto-approval on the
+	// Go side via ClaudeProcess.AutoApprove instead of relying on CLI flags.
+	args = append(args, "--permission-prompt-tool", "stdio")
 
 	if opts.SessionID != "" {
 		if opts.Resume {
