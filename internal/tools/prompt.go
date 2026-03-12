@@ -68,6 +68,8 @@ type ChatEvent struct {
 	ToolName   string        `json:"tool_name,omitempty"`
 	ToolID     string        `json:"tool_id,omitempty"`
 	ToolInput  string        `json:"tool_input,omitempty"`
+	ToolData   string        `json:"tool_data,omitempty"`   // Full JSON input for rich rendering
+	ToolResult string        `json:"tool_result,omitempty"` // Tool output/result content
 	ToolError  bool          `json:"tool_error,omitempty"`
 	TokensIn   int64         `json:"tokens_in,omitempty"`
 	TokensOut  int64         `json:"tokens_out,omitempty"`
@@ -110,13 +112,14 @@ type SpawnOptions struct {
 
 // ChatResponse mirrors the internal ChatResponse for use by tool handlers.
 type ChatResponse struct {
-	ResponseText string  `json:"response_text"`
-	TokensIn     int64   `json:"tokens_in"`
-	TokensOut    int64   `json:"tokens_out"`
-	CostUSD      float64 `json:"cost_usd"`
-	ModelUsed    string  `json:"model_used"`
-	DurationMs   int64   `json:"duration_ms"`
-	SessionID    string  `json:"session_id"`
+	ResponseText string      `json:"response_text"`
+	TokensIn     int64       `json:"tokens_in"`
+	TokensOut    int64       `json:"tokens_out"`
+	CostUSD      float64     `json:"cost_usd"`
+	ModelUsed    string      `json:"model_used"`
+	DurationMs   int64       `json:"duration_ms"`
+	SessionID    string      `json:"session_id"`
+	ToolEvents   []ChatEvent `json:"tool_events,omitempty"`
 }
 
 // Bridge holds the injected dependencies that tool handlers need.
@@ -500,27 +503,25 @@ func ChatStream(bridge *Bridge) plugin.StreamingToolHandler {
 	}
 }
 
-// formatChatResponse formats a ChatResponse as a Markdown string for display.
+// formatChatResponse returns the ChatResponse as a JSON string with clean
+// structured fields. Callers (send_message, ai_prompt) parse the JSON to
+// extract response text and metadata separately — no regex stripping needed.
 func formatChatResponse(resp *ChatResponse) string {
-	var b strings.Builder
-	b.WriteString(resp.ResponseText)
-	b.WriteString("\n\n---\n")
-
-	if resp.SessionID != "" {
-		fmt.Fprintf(&b, "- **Session:** %s\n", resp.SessionID)
+	data := map[string]any{
+		"response":    resp.ResponseText,
+		"session_id":  resp.SessionID,
+		"model":       resp.ModelUsed,
+		"tokens_in":   resp.TokensIn,
+		"tokens_out":  resp.TokensOut,
+		"cost_usd":    resp.CostUSD,
+		"duration_ms": resp.DurationMs,
 	}
-	if resp.ModelUsed != "" {
-		fmt.Fprintf(&b, "- **Model:** %s\n", resp.ModelUsed)
+	if len(resp.ToolEvents) > 0 {
+		data["tool_events"] = resp.ToolEvents
 	}
-	if resp.TokensIn > 0 || resp.TokensOut > 0 {
-		fmt.Fprintf(&b, "- **Tokens:** %d in / %d out\n", resp.TokensIn, resp.TokensOut)
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return resp.ResponseText // fallback to raw text
 	}
-	if resp.CostUSD > 0 {
-		fmt.Fprintf(&b, "- **Cost:** $%.4f\n", resp.CostUSD)
-	}
-	if resp.DurationMs > 0 {
-		fmt.Fprintf(&b, "- **Duration:** %dms\n", resp.DurationMs)
-	}
-
-	return b.String()
+	return string(raw)
 }

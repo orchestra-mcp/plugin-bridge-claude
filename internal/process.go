@@ -49,6 +49,9 @@ type ChatResponse struct {
 	ModelUsed    string  `json:"model_used"`
 	DurationMs   int64   `json:"duration_ms"`
 	SessionID    string  `json:"session_id"`
+	// ToolEvents collects tool_start/tool_end events emitted during the turn.
+	// Stored alongside the response so sessions can be fully reconstructed on refresh.
+	ToolEvents []ChatEvent `json:"tool_events,omitempty"`
 }
 
 // StdioPermissionRequest is emitted when Claude needs permission for a tool call
@@ -107,6 +110,8 @@ type ChatEvent struct {
 	ToolName   string        `json:"tool_name,omitempty"`
 	ToolID     string        `json:"tool_id,omitempty"`
 	ToolInput  string        `json:"tool_input,omitempty"`
+	ToolData   string        `json:"tool_data,omitempty"` // Full JSON input for rich rendering
+	ToolResult string        `json:"tool_result,omitempty"` // Tool output/result content
 	ToolError  bool          `json:"tool_error,omitempty"`
 	TokensIn   int64         `json:"tokens_in,omitempty"`
 	TokensOut  int64         `json:"tokens_out,omitempty"`
@@ -156,10 +161,11 @@ type ClaudeProcess struct {
 	// scanner goroutine doesn't block. TCP streaming handler drains this.
 	EventCh chan ChatEvent
 
-	mu       sync.Mutex
-	exitErr  error
-	finished bool
-	response *ChatResponse
+	mu           sync.Mutex
+	exitErr      error
+	finished     bool
+	response     *ChatResponse
+	toolEvents   []ChatEvent // Collected tool_start/tool_end events for persistence
 
 	stdinPipe io.WriteCloser
 	stdinMu   sync.Mutex
@@ -298,38 +304,33 @@ func (cp *ClaudeProcess) WritePermission(requestID string, approved bool, toolIn
 }
 
 // WriteQuestion sends an AskUserQuestion answer back to the Claude process.
-// AskUserQuestion goes through the same can_use_tool permission flow as other
-// tools. Claude CLI validates updatedInput against the tool's Zod schema, so
-// we must echo the FULL original tool input (questions, options, etc.) with
-// the user's answers merged in. This matches the orch-ref desktop flow:
-// submitQuestionAnswer → bridge.Permission({toolInput: {answers}}).
+// Claude CLI expects the control_response for questions to contain ONLY the
+// answers object — NOT the full original tool input merged in. This matches
+// the orch-ref desktop flow: submitQuestionAnswer sends toolInput: { answers }
+// which becomes updatedInput: { answers: {...} } in the control_response.
 //
-// rawInput is the original AskUserQuestion tool input from the control_request.
 // answer is either a JSON string like `{"answers":{...}}` or a plain string.
 func (cp *ClaudeProcess) WriteQuestion(requestID, answer string, rawInput json.RawMessage) error {
-	// Start with the full original tool input so all required fields
-	// (questions, header, options, etc.) are present for Zod validation.
-	merged := map[string]any{}
-	if len(rawInput) > 0 {
-		_ = json.Unmarshal(rawInput, &merged)
-	}
+	// Build updatedInput with ONLY the answers — do NOT include original
+	// rawInput fields (questions, options, headers). Claude CLI's Zod
+	// validation rejects unexpected fields in updatedInput.
+	result := map[string]any{}
 
-	// Parse the answer and merge answers into the original input.
 	var answerData map[string]any
 	if json.Valid([]byte(answer)) {
 		_ = json.Unmarshal([]byte(answer), &answerData)
 	}
 
 	if answers, ok := answerData["answers"]; ok {
-		merged["answers"] = answers
+		result["answers"] = answers
 	} else if answer != "" {
 		// Plain string fallback.
-		merged["answers"] = map[string]string{
+		result["answers"] = map[string]string{
 			"question": answer,
 		}
 	}
 
-	toolInput, _ := json.Marshal(merged)
+	toolInput, _ := json.Marshal(result)
 	return cp.WritePermission(requestID, true, json.RawMessage(toolInput))
 }
 
@@ -722,6 +723,11 @@ func SpawnBackground(ctx context.Context, opts SpawnOptions) (*ClaudeProcess, er
 			}
 		}
 
+		cp.mu.Lock()
+		collectedEvents := make([]ChatEvent, len(cp.toolEvents))
+		copy(collectedEvents, cp.toolEvents)
+		cp.mu.Unlock()
+
 		resp := &ChatResponse{
 			ResponseText: text,
 			TokensIn:     tokensIn,
@@ -730,6 +736,7 @@ func SpawnBackground(ctx context.Context, opts SpawnOptions) (*ClaudeProcess, er
 			ModelUsed:    modelUsed,
 			DurationMs:   durationMs,
 			SessionID:    sessionID,
+			ToolEvents:   collectedEvents,
 		}
 
 		cp.markDone(waitErr, resp)
@@ -1012,9 +1019,17 @@ func emitEvent(cp *ClaudeProcess, event map[string]any, sessionID string, toolID
 						name, _ := blockMap["name"].(string)
 						id, _ := blockMap["id"].(string)
 						summary := summarizeToolInput(blockMap["input"])
+						// Serialize full tool input as JSON for rich frontend rendering.
+						var toolDataStr string
+						if blockMap["input"] != nil {
+							if raw, err := json.Marshal(blockMap["input"]); err == nil {
+								toolDataStr = string(raw)
+							}
+						}
 						trySendEvent(cp, ChatEvent{
 							Type: EventToolStart, SessionID: sessionID,
 							ToolName: name, ToolID: id, ToolInput: summary,
+							ToolData: toolDataStr,
 						})
 						trySendEvent(cp, ChatEvent{
 							Type: EventStatus, SessionID: sessionID,
@@ -1039,10 +1054,24 @@ func emitEvent(cp *ClaudeProcess, event map[string]any, sessionID string, toolID
 					}
 					toolUseID, _ := blockMap["tool_use_id"].(string)
 					isError, _ := blockMap["is_error"].(bool)
+					// Extract tool result content for rich frontend rendering.
+					var resultContent string
+					if rc, ok := blockMap["content"].(string); ok {
+						resultContent = rc
+					} else if rcArr, ok := blockMap["content"].([]any); ok {
+						// Content can be an array of blocks [{type:"text",text:"..."}]
+						for _, rcBlock := range rcArr {
+							if rcMap, ok := rcBlock.(map[string]any); ok {
+								if t, ok := rcMap["text"].(string); ok {
+									resultContent += t
+								}
+							}
+						}
+					}
 					trySendEvent(cp, ChatEvent{
 						Type: EventToolEnd, SessionID: sessionID,
 						ToolID: toolUseID, ToolName: toolIDMap[toolUseID],
-						ToolError: isError,
+						ToolError: isError, ToolResult: resultContent,
 					})
 				}
 			}
@@ -1069,6 +1098,12 @@ func emitEvent(cp *ClaudeProcess, event map[string]any, sessionID string, toolID
 
 // trySendEvent sends a ChatEvent to EventCh non-blocking.
 func trySendEvent(cp *ClaudeProcess, ev ChatEvent) {
+	// Collect tool events for persistence in ChatResponse.
+	if ev.Type == EventToolStart || ev.Type == EventToolEnd {
+		cp.mu.Lock()
+		cp.toolEvents = append(cp.toolEvents, ev)
+		cp.mu.Unlock()
+	}
 	if cp.EventCh == nil {
 		return
 	}
@@ -1235,27 +1270,9 @@ func parseStreamEvent(
 		}
 
 	case "user":
-		if msg, ok := event["message"].(map[string]any); ok {
-			if contentArr, ok := msg["content"].([]any); ok {
-				for _, block := range contentArr {
-					blockMap, ok := block.(map[string]any)
-					if !ok || blockMap["type"] != "tool_result" {
-						continue
-					}
-					toolUseID, _ := blockMap["tool_use_id"].(string)
-					toolName := toolIDMap[toolUseID]
-					if toolName == "" {
-						continue
-					}
-					isError, _ := blockMap["is_error"].(bool)
-					marker := "\u2713" // ✓
-					if isError {
-						marker = "\u2717" // ✗
-					}
-					fmt.Fprintf(responseText, "%s %s\n", marker, toolName)
-				}
-			}
-		}
+		// Tool results are handled by emitEvent (tool_end events) — do NOT
+		// append ✓/✗ markers to response text. The response text should only
+		// contain Claude's actual markdown response.
 
 	case "content_block_delta":
 		if delta, ok := event["delta"].(map[string]any); ok {
@@ -1309,6 +1326,9 @@ func parseStreamEvent(
 }
 
 // extractAssistantText pulls text from the content blocks of an assistant message.
+// Only actual text content is appended to buf. Tool use blocks are tracked in
+// toolIDMap for event emission but NOT appended to the response text — tool
+// events are delivered separately via ChatEvent stream.
 func extractAssistantText(msg map[string]any, buf *strings.Builder, toolIDMap map[string]string) {
 	content, ok := msg["content"]
 	if !ok {
@@ -1333,18 +1353,14 @@ func extractAssistantText(msg map[string]any, buf *strings.Builder, toolIDMap ma
 					buf.WriteByte('\n')
 				}
 			case "tool_use":
+				// Track tool ID → name mapping for emitEvent (tool_start/tool_end).
+				// Do NOT append ⚙ markers to response text — events are separate.
 				toolName, _ := blockMap["name"].(string)
 				if toolName == "" {
 					continue
 				}
 				if id, ok := blockMap["id"].(string); ok && id != "" && toolIDMap != nil {
 					toolIDMap[id] = toolName
-				}
-				argSummary := summarizeToolInput(blockMap["input"])
-				if argSummary != "" {
-					fmt.Fprintf(buf, "\u2699 %s: %s\n", toolName, argSummary)
-				} else {
-					fmt.Fprintf(buf, "\u2699 %s\n", toolName)
 				}
 			}
 		}

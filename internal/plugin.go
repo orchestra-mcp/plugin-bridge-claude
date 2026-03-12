@@ -183,6 +183,8 @@ func (bp *BridgePlugin) DrainSessionEvents() []tools.ChatEvent {
 					ToolName:   ev.ToolName,
 					ToolID:     ev.ToolID,
 					ToolInput:  ev.ToolInput,
+					ToolData:   ev.ToolData,
+					ToolResult: ev.ToolResult,
 					ToolError:  ev.ToolError,
 					TokensIn:   ev.TokensIn,
 					TokensOut:  ev.TokensOut,
@@ -384,6 +386,8 @@ func (a *processAdapter) GetEventCh() <-chan tools.ChatEvent {
 				ToolName:   ev.ToolName,
 				ToolID:     ev.ToolID,
 				ToolInput:  ev.ToolInput,
+				ToolData:   ev.ToolData,
+				ToolResult: ev.ToolResult,
 				ToolError:  ev.ToolError,
 				TokensIn:   ev.TokensIn,
 				TokensOut:  ev.TokensOut,
@@ -445,7 +449,7 @@ func convertResp(resp *ChatResponse) *tools.ChatResponse {
 	if resp == nil {
 		return nil
 	}
-	return &tools.ChatResponse{
+	tr := &tools.ChatResponse{
 		ResponseText: resp.ResponseText,
 		TokensIn:     resp.TokensIn,
 		TokensOut:    resp.TokensOut,
@@ -454,4 +458,28 @@ func convertResp(resp *ChatResponse) *tools.ChatResponse {
 		DurationMs:   resp.DurationMs,
 		SessionID:    resp.SessionID,
 	}
+	if len(resp.ToolEvents) > 0 {
+		tr.ToolEvents = make([]tools.ChatEvent, len(resp.ToolEvents))
+		for i, ev := range resp.ToolEvents {
+			tr.ToolEvents[i] = tools.ChatEvent{
+				Type:       tools.ChatEventType(ev.Type),
+				SessionID:  ev.SessionID,
+				Text:       ev.Text,
+				ToolName:   ev.ToolName,
+				ToolID:     ev.ToolID,
+				ToolInput:  ev.ToolInput,
+				ToolData:   ev.ToolData,
+				ToolResult: ev.ToolResult,
+				ToolError:  ev.ToolError,
+				TokensIn:   ev.TokensIn,
+				TokensOut:  ev.TokensOut,
+				CostUSD:    ev.CostUSD,
+				ModelUsed:  ev.ModelUsed,
+				DurationMs: ev.DurationMs,
+				RequestID:  ev.RequestID,
+				Reason:     ev.Reason,
+			}
+		}
+	}
+	return tr
 }
